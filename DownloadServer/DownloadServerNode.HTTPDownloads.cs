@@ -89,6 +89,18 @@ namespace cloud.charging.open.DownloadServer
 
         #endregion
 
+        #region UnfinishedDownloadAfter
+
+        /// <summary>
+        /// How long nothing of an HTTP download may be read before it counts as
+        /// given up: recorded with what was read of it, and its file closed. Ten
+        /// minutes: a charging station on a slow line that reads now and then
+        /// is no client that went away.
+        /// </summary>
+        public TimeSpan UnfinishedDownloadAfter { get; set; } = TimeSpan.FromMinutes(10);
+
+        #endregion
+
 
         #region (private) RegisterHTTPDownloads(Server)
 
@@ -252,7 +264,29 @@ namespace cloud.charging.open.DownloadServer
 
                 stream.Seek(first, SeekOrigin.Begin);
 
-                response.ContentStream = new FileSlice(stream, length);
+                // Recorded as what was read of it: once the last byte is, or -
+                // the client gone - once nothing was read for a while.
+                response.ContentStream = new FileSlice(stream,
+                                                       length,
+                                                       UnfinishedDownloadAfter,
+                                                       delivered => {
+
+                                                           var download = Downloads.Record(DownloadProtocol.HTTP,
+                                                                                           downloader,
+                                                                                           file.Area,
+                                                                                           file.Name,
+                                                                                           range is not null ? 206 : 200,
+                                                                                           first,
+                                                                                           delivered,
+                                                                                           file.Size,
+                                                                                           from,
+                                                                                           Request.UserAgent);
+
+                                                           Log.Notice($"'{downloader}' downloaded '{file.Path}' by HTTP from {from}: {SizeOf(delivered)}{(range is not null ? $" from byte {first} on" : "")}" +
+                                                                      $"{(delivered < length ? $", {SizeOf(length - delivered)} less than it was sent - the client stopped reading" : "")}.",
+                                                                      "downloadserver", "downloads", "http");
+
+                                                       });
 
             }
             catch (Exception problem) when (problem is IOException or UnauthorizedAccessException)
@@ -263,20 +297,6 @@ namespace cloud.charging.open.DownloadServer
                 return Task.FromResult(Answer(Request, HTTPStatusCode.InternalServerError, "The file could not be read. The log of the download server says why."));
 
             }
-
-            var download = Downloads.Record(DownloadProtocol.HTTP,
-                                            downloader,
-                                            file.Area,
-                                            file.Name,
-                                            range is not null ? 206 : 200,
-                                            first,
-                                            length,
-                                            file.Size,
-                                            from,
-                                            Request.UserAgent);
-
-            Log.Notice($"'{downloader}' downloads '{file.Path}' by HTTP from {from}: {SizeOf(length)}{(range is not null ? $" from byte {first} on" : "")}.",
-                       "downloadserver", "downloads", "http");
 
             return Task.FromResult(response.AsImmutable);
 
@@ -487,14 +507,43 @@ namespace cloud.charging.open.DownloadServer
         /// they are read, or the response is done with them.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// It cannot seek, so that the server takes the length the response
         /// says rather than the length of the whole file.
+        /// </para>
+        /// <para>
+        /// It says once how many bytes were read of it: as soon as the last one
+        /// is - before it is sent, so that whoever waits for the download finds
+        /// it recorded -, where it is disposed of before that, and where nothing
+        /// was read of it for the given time: the client went away, and the
+        /// server, which goes on with the next request, never reads it again.
+        /// The file is closed then as well.
+        /// </para>
         /// </remarks>
-        private sealed class FileSlice(FileStream  File,
-                                       Int64       Length) : Stream
+        private sealed class FileSlice : Stream
         {
 
-            private Int64 left = Length;
+            private readonly FileStream     file;
+            private readonly Action<Int64>  ended;
+            private readonly Timer          idle;
+            private readonly TimeSpan       idleAfter;
+            private          Int64          left;
+            private          Int64          read;
+            private          Int32          told;
+
+            public FileSlice(FileStream     File,
+                             Int64          Length,
+                             TimeSpan       GivenUpAfter,
+                             Action<Int64>  Ended)
+            {
+
+                this.file       = File;
+                this.left       = Length;
+                this.ended      = Ended;
+                this.idleAfter  = GivenUpAfter;
+                this.idle       = new Timer(_ => End(), null, GivenUpAfter, Timeout.InfiniteTimeSpan);
+
+            }
 
             public override Boolean  CanRead   => true;
             public override Boolean  CanSeek   => false;
@@ -513,20 +562,13 @@ namespace cloud.charging.open.DownloadServer
             public override Int32 Read(Span<Byte> Buffer)
             {
 
-                if (left <= 0)
+                if (left <= 0 || Volatile.Read(ref told) != 0)
                 {
-                    File.Dispose();
+                    End();
                     return 0;
                 }
 
-                var read = File.Read(Buffer[..(Int32) Math.Min(Buffer.Length, left)]);
-
-                left -= read;
-
-                if (read == 0)
-                    File.Dispose();
-
-                return read;
+                return Counted(file.Read(Buffer[..(Int32) Math.Min(Buffer.Length, left)]));
 
             }
 
@@ -536,20 +578,48 @@ namespace cloud.charging.open.DownloadServer
             public override async ValueTask<Int32> ReadAsync(Memory<Byte> Buffer, CancellationToken CancellationToken = default)
             {
 
-                if (left <= 0)
+                if (left <= 0 || Volatile.Read(ref told) != 0)
                 {
-                    await File.DisposeAsync();
+                    End();
                     return 0;
                 }
 
-                var read = await File.ReadAsync(Buffer[..(Int32) Math.Min(Buffer.Length, left)], CancellationToken);
+                return Counted(await file.ReadAsync(Buffer[..(Int32) Math.Min(Buffer.Length, left)], CancellationToken));
 
-                left -= read;
+            }
 
-                if (read == 0)
-                    await File.DisposeAsync();
+            /// <summary>
+            /// What a read brought, counted - and the end said where it was the
+            /// last of it, or the file has no more.
+            /// </summary>
+            private Int32 Counted(Int32 Read)
+            {
 
-                return read;
+                left -= Read;
+                read += Read;
+
+                if (left <= 0 || Read == 0)
+                    End();
+                else
+                    try { idle.Change(idleAfter, Timeout.InfiniteTimeSpan); } catch (ObjectDisposedException) { }
+
+                return Read;
+
+            }
+
+            /// <summary>
+            /// Said once: how many bytes were read; and the file closed.
+            /// </summary>
+            private void End()
+            {
+
+                if (Interlocked.Exchange(ref told, 1) != 0)
+                    return;
+
+                idle.Dispose();
+                file.Dispose();
+
+                try { ended(Interlocked.Read(ref read)); } catch (Exception) { }
 
             }
 
@@ -561,13 +631,13 @@ namespace cloud.charging.open.DownloadServer
             protected override void Dispose(Boolean Disposing)
             {
                 if (Disposing)
-                    File.Dispose();
+                    End();
                 base.Dispose(Disposing);
             }
 
             public override async ValueTask DisposeAsync()
             {
-                await File.DisposeAsync();
+                End();
                 await base.DisposeAsync();
             }
 

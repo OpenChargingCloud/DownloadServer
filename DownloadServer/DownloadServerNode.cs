@@ -505,17 +505,16 @@ namespace cloud.charging.open.DownloadServer
         #endregion
 
 
-        #region WebMaxFileSize
+        #region WebPartSize
 
         /// <summary>
-        /// The largest file that may be published through the web interface:
-        /// what the section allows, and no more than the web interface's HTTP
-        /// server takes as the body of one request. A larger one is published
-        /// over SFTP, or put in its area's directory.
+        /// How large the parts are the web interface sends a file in, where it
+        /// is larger: 4 MiB, and no more than half of what the web interface's
+        /// HTTP server takes as the body of one request.
         /// </summary>
-        public Int64 WebMaxFileSize
+        public Int64 WebPartSize
 
-            => Math.Min(Settings.MaxFileSize, (Int64) Math.Min(HTTPServer.MaxHTTPBodySize, (UInt64) Int64.MaxValue));
+            => Math.Max(64 * 1024, Math.Min(4L * 1024 * 1024, (Int64) Math.Min(HTTPServer.MaxHTTPBodySize / 2, (UInt64) Int64.MaxValue)));
 
         #endregion
 
@@ -588,7 +587,7 @@ namespace cloud.charging.open.DownloadServer
                                                                   )
                                                                 : null),
                        new JProperty("maxFileSize",         Settings.MaxFileSize),
-                       new JProperty("webMaxFileSize",      WebMaxFileSize),
+                       new JProperty("webPartSize",         WebPartSize),
                        new JProperty("files",               files.Count),
                        new JProperty("totalSize",           files.Sum(file => file.Size)),
                        new JProperty("downloads",           Downloads.Count),

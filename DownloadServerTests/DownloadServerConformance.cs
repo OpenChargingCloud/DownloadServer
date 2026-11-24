@@ -366,6 +366,122 @@ namespace cloud.charging.open.DownloadServer.Tests
 
         #endregion
 
+        #region AFileLargerThanOneRequest_IsPublishedInParts()
+
+        /// <summary>
+        /// A file of 20 MiB - more than the web interface takes in one request -
+        /// published in parts, as the web interface sends it: each at the byte
+        /// the one before ended; one at another byte refused with where it is
+        /// to go on; the last one puts the file in place, whole.
+        /// </summary>
+        [Test]
+        public async Task AFileLargerThanOneRequest_IsPublishedInParts()
+        {
+
+            using var http      = await SignedIn();
+
+            var image           = RandomNumberGenerator.GetBytes(20 * 1024 * 1024);
+            var part            = (Int32) DownloadServer.WebPartSize;
+            var path            = "api/v1/downloadServer/files/firmware/large.bin";
+
+            async Task<(HttpStatusCode Status, JObject JSON)> Part(Int64 Offset, Int32 Length, Boolean Final = false)
+            {
+                var response = await http.PutAsync($"{path}?offset={Offset}{(Final ? "&final=true" : "")}", new ByteArrayContent(image, (Int32) Offset, Length));
+                return (response.StatusCode, JObject.Parse(await response.Content.ReadAsStringAsync()));
+            }
+
+            var (first, firstSaid) = await Part(0, part);
+
+            Assert.That(first,                                          Is.EqualTo(HttpStatusCode.OK), firstSaid.ToString());
+            Assert.That(firstSaid["received"]!.Value<Int64>(),          Is.EqualTo(part));
+            Assert.That(DownloadServer.Files("firmware"),               Is.Empty, "A file is offered before its last part is there.");
+
+            var (wrong, wrongSaid) = await Part(2L * part, part);
+
+            Assert.That(wrong,                                          Is.EqualTo(HttpStatusCode.Conflict));
+            Assert.That(wrongSaid["received"]!.Value<Int64>(),          Is.EqualTo(part), "A part at another byte does not say where to go on.");
+
+            Int64 offset = part;
+
+            while (offset < image.Length)
+            {
+
+                var length              = (Int32) Math.Min(part, image.Length - offset);
+                var final               = offset + length >= image.Length;
+                var (status, said)      = await Part(offset, length, final);
+
+                Assert.That(status, Is.EqualTo(HttpStatusCode.OK), said.ToString());
+
+                offset = said["received"]!.Value<Int64>();
+
+            }
+
+            Assert.Multiple(() => {
+                Assert.That(File.ReadAllBytes(Path.Combine(DownloadServer.DirectoryOf("firmware"), "large.bin")), Is.EqualTo(image), "The file is not there whole.");
+                Assert.That(System.IO.Directory.GetFiles(DownloadServer.DirectoryOf("firmware")),                Has.Length.EqualTo(1), "Something of the parts is left beside it.");
+                Assert.That(DownloadServer.WebPartSize * 2,                                                       Is.LessThanOrEqualTo((Int64) DownloadServer.HTTPServer.MaxHTTPBodySize));
+            });
+
+        }
+
+        #endregion
+
+        #region ADownloadTheClientGaveUp_IsRecordedWithWhatWasRead()
+
+        /// <summary>
+        /// A downloader reads 64 KiB of a file of 32 MiB and goes away: once
+        /// nothing more was read for a while, the download is recorded with
+        /// what was read - more than the client took, as buffers lie in
+        /// between, and far less than the file -, and not as the whole file.
+        /// </summary>
+        [Test]
+        public async Task ADownloadTheClientGaveUp_IsRecordedWithWhatWasRead()
+        {
+
+            using var http      = await SignedIn();
+
+            var image           = RandomNumberGenerator.GetBytes(32 * 1024 * 1024);
+
+            File.WriteAllBytes(Path.Combine(DownloadServer.DirectoryOf("firmware"), "large.bin"), image);
+
+            DownloadServer.UnfinishedDownloadAfter = TimeSpan.FromSeconds(1);
+
+            var password        = await ADownloader(http, "CS001");
+
+            using (var station = DownloadClient("CS001", password))
+            using (var response = await station.GetAsync("firmware/large.bin", HttpCompletionOption.ResponseHeadersRead))
+            {
+
+                Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK));
+
+                await using var body = await response.Content.ReadAsStreamAsync();
+
+                var buffer  = new Byte[64 * 1024];
+                var read    = 0;
+
+                while (read < buffer.Length)
+                    read += await body.ReadAsync(buffer.AsMemory(read));
+
+            }
+
+            var until = DateTimeOffset.UtcNow.AddSeconds(20);
+
+            while (DownloadServer.Downloads.Count == 0 && DateTimeOffset.UtcNow < until)
+                await Task.Delay(100);
+
+            var download = DownloadServer.Downloads.All.Single();
+
+            Assert.Multiple(() => {
+                Assert.That(download.Bytes,     Is.GreaterThanOrEqualTo(64 * 1024));
+                Assert.That(download.Bytes,     Is.LessThan(image.Length / 2), "Recorded as nearly the whole file.");
+                Assert.That(download.ToTheEnd,  Is.False);
+                Assert.That(download.Size,      Is.EqualTo(image.Length));
+            });
+
+        }
+
+        #endregion
+
         #region ADownloaderGivenANewPasswordOrTakenAway_MayNoLongerDownloadWithTheOldOne()
 
         [Test]

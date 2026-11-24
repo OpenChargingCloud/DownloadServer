@@ -308,6 +308,98 @@ namespace cloud.charging.open.DownloadServer
 
         #endregion
 
+        #region PublishPartAsync(Area, Name, Offset, Content, Final, By, CancellationToken)
+
+        /// <summary>
+        /// One part of a file published in parts - as the web interface sends a
+        /// file larger than its HTTP server takes in one request: appended at
+        /// the given offset to what the parts before brought, under a hidden
+        /// name of the one who publishes and the name of the file; the last
+        /// part, Final, puts the file in place, in the place of the one of that
+        /// name.
+        /// </summary>
+        /// <remarks>
+        /// A part at offset 0 begins anew. A part at another offset than the
+        /// length of what is there is refused, and says that length - for the
+        /// one who sends to go on from there.
+        /// </remarks>
+        /// <returns>The file, once the last part put it in place; how many bytes are there; or why nothing is.</returns>
+        public async Task<(OfferedFile? File, Int64 Received, String? Refused, Boolean AtAnotherOffset)> PublishPartAsync(String             Area,
+                                                                                                                         String             Name,
+                                                                                                                         Int64              Offset,
+                                                                                                                         Stream             Content,
+                                                                                                                         Boolean            Final,
+                                                                                                                         String             By,
+                                                                                                                         CancellationToken  CancellationToken = default)
+        {
+
+            if (!HasArea(Area))
+                return (null, 0, $"There is no area '{Area}'. The areas are {String.Join(", ", Settings.Areas.Select(area => $"'{area}'"))}.", false);
+
+            if (!IsFileName(Name))
+                return (null, 0, $"'{Name}' is no name a file offered can have: one part, without '/', '\\' or ':', and not beginning with a dot.", false);
+
+            var directory  = DirectoryOf(Area);
+            var hidden     = System.IO.Path.Combine(directory, $"{PublishPrefix}{Convert.ToHexStringLower(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes($"{By}\n{Name}")))[..32]}");
+
+            Directory.CreateDirectory(directory);
+
+            Int64 received;
+
+            await using (var file = new FileStream(hidden, Offset == 0 ? FileMode.Create : FileMode.OpenOrCreate, FileAccess.Write, FileShare.None, 81920, FileOptions.Asynchronous))
+            {
+
+                if (file.Length != Offset)
+                    return (null, file.Length, $"What the parts before brought of '{Name}' ends at byte {file.Length}, and not at {Offset}: go on from {file.Length}, or begin anew at 0.", true);
+
+                file.Seek(0, SeekOrigin.End);
+
+                var buffer = new Byte[81920];
+                Int32 read;
+
+                received = Offset;
+
+                while ((read = await Content.ReadAsync(buffer, CancellationToken)) > 0)
+                {
+
+                    received += read;
+
+                    if (received > Settings.MaxFileSize)
+                    {
+                        file.SetLength(0);
+                        return (null, 0, $"'{Name}' is larger than the {SizeOf(Settings.MaxFileSize)} this download server takes.", false);
+                    }
+
+                    await file.WriteAsync(buffer.AsMemory(0, read), CancellationToken);
+
+                }
+
+            }
+
+            if (!Final)
+                return (null, received, null, false);
+
+            if (received == 0)
+            {
+                try { File.Delete(hidden); } catch (Exception) { }
+                return (null, 0, $"'{Name}' is empty: there is nothing to offer.", false);
+            }
+
+            File.Move(hidden, PathOf(Area, Name), overwrite: true);
+
+            if (!TryGetFile(Area, Name, out var published, out _))
+                return (null, received, $"'/{Area}/{Name}' was written, but cannot be read back.", false);
+
+            Log.Notice($"'{By}' published '{published.Path}' in parts: {SizeOf(published.Size)}, SHA-256 {published.SHA256}.", "downloadserver", "files");
+
+            RaisePublished(published, By);
+
+            return (published, received, null, false);
+
+        }
+
+        #endregion
+
         #region RemoveFile(Area, Name, By, out Refused)
 
         /// <summary>

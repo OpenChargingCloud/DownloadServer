@@ -14,8 +14,8 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
  * and to take away -, and a file to publish.
  *
  * The disk is what is offered: a file put in an area's directory by hand, or
- * published over SFTP, is here as well. Through this page a file is as large
- * as the web interface takes a request; a larger one is published over SFTP.
+ * published over SFTP, is here as well. A file larger than the web interface
+ * takes in one request is sent in parts, one after the other.
  * A file published, taken away or downloaded elsewhere is drawn as it
  * happens, where the node's event stream runs.
  */
@@ -38,7 +38,8 @@ export const filesPage: Page = {
 
         let cancelled     = false;
         let current: Files | null = null;
-        let webMaxFileSize = 0;
+        let maxFileSize   = 0;
+        let partSize      = 4 * 1024 * 1024;
         let area          = url.searchParams.get('area') ?? '';
         let opened        = new Set<string>();
         let said          = '';
@@ -179,8 +180,8 @@ export const filesPage: Page = {
                         <label>File
                             <input type="file" name="file" required ?disabled=${!mayPublish} />
                             <span class="hint">
-                                Offered under its name, in the place of a file of that name. Up to ${sizeOf(webMaxFileSize)}
-                                here; a larger one is published over SFTP, or put in its area's directory.
+                                Offered under its name, in the place of a file of that name, once it is all there - up to
+                                ${sizeOf(maxFileSize)}, sent in parts of ${sizeOf(partSize)} where it is larger.
                             </span>
                         </label>
 
@@ -214,9 +215,9 @@ export const filesPage: Page = {
             if (file === undefined || target === '')
                 return;
 
-            if (webMaxFileSize > 0 && file.size > webMaxFileSize) {
+            if (maxFileSize > 0 && file.size > maxFileSize) {
                 if (error !== null)
-                    error.textContent = `${file.name} has ${sizeOf(file.size)}, and the web interface takes ${sizeOf(webMaxFileSize)}. Publish it over SFTP, or put it in its area's directory.`;
+                    error.textContent = `${file.name} has ${sizeOf(file.size)}, and this download server takes ${sizeOf(maxFileSize)}.`;
                 return;
             }
 
@@ -225,7 +226,14 @@ export const filesPage: Page = {
                 try
                 {
 
-                    const published = await whileSaving(content, note, () => api.downloadServer.publish(target, file.name, file));
+                    // Where it goes in parts, how far it is.
+                    const progress = (Sent: number, Of: number): void => {
+                        const shown = content.querySelector<HTMLElement>('#publish-note');
+                        if (shown !== null)
+                            shown.textContent = `${sizeOf(Sent)} of ${sizeOf(Of)} sent ...`;
+                    };
+
+                    const published = await whileSaving(content, note, () => api.downloadServer.publish(target, file.name, file, partSize, progress));
 
                     form.reset();
                     said     = published.said;
@@ -316,7 +324,8 @@ export const filesPage: Page = {
                     return;
 
                 current         = loaded;
-                webMaxFileSize  = status.webMaxFileSize;
+                maxFileSize     = status.maxFileSize;
+                partSize        = status.webPartSize;
 
                 draw();
 

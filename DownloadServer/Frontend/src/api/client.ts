@@ -155,8 +155,8 @@ export interface DownloadServerStatus {
     sftp:             { serving: boolean; port: number | null; passwords: boolean } | null;
     /** The largest file that may be published, in bytes. */
     maxFileSize:      number;
-    /** The largest file that may be published through the web interface, in bytes: what its HTTP server takes. */
-    webMaxFileSize:   number;
+    /** How large the parts are the web interface sends a larger file in, in bytes: what its HTTP server takes in one request, with room to spare. */
+    webPartSize:      number;
     files:            number;
     /** In bytes. */
     totalSize:        number;
@@ -206,14 +206,10 @@ function filePath(Area: string, Name: string): string {
 }
 
 
-/**
- * Publish a file: its bytes as the body of a PUT, as they are - which the
- * JSON request of every node does not send. Same origin, so the session
- * cookie travels with it.
- */
-async function publish(Area: string, Name: string, Content: Blob): Promise<Published> {
+/** One PUT of bytes, as they are - which the JSON request of every node does not send - and its answer. Same origin, so the session cookie travels with it. */
+async function put<T>(Path: string, Content: Blob): Promise<T> {
 
-    const response = await fetch(apiURL(filePath(Area, Name)), {
+    const response = await fetch(apiURL(Path), {
                                method:       'PUT',
                                headers:      { 'Accept': 'application/json', 'Content-Type': 'application/octet-stream' },
                                credentials:  'same-origin',
@@ -231,14 +227,50 @@ async function publish(Area: string, Name: string, Content: Blob): Promise<Publi
         const said = json !== null && typeof json === 'object' && 'error' in json && typeof (json as { error: unknown }).error === 'string'
                          ? (json as { error: string }).error
                          : response.status === 413
-                               ? 'The file is larger than the web interface takes. Publish it over SFTP, or put it in its area\'s directory.'
+                               ? 'A part is larger than the web interface takes.'
                                : `The download server answered ${response.status}.`;
 
         throw new Error(said);
 
     }
 
-    return json as Published;
+    return json as T;
+
+}
+
+
+/**
+ * Publish a file: whole with one PUT where it fits into one part, and else in
+ * parts, one after the other - "?offset=" says where each begins, the last
+ * one says "&final=true" -, as the web interface's HTTP server takes no more
+ * than so much in one request. Told after each part how many bytes are there.
+ */
+async function publish(Area:      string,
+                       Name:      string,
+                       Content:   Blob,
+                       PartSize:  number,
+                       Progress?: (Sent: number, Of: number) => void): Promise<Published> {
+
+    if (Content.size <= PartSize)
+        return put<Published>(filePath(Area, Name), Content);
+
+    let offset = 0;
+
+    while (true) {
+
+        const end    = Math.min(offset + PartSize, Content.size);
+        const final  = end >= Content.size;
+        const done   = await put<Published & { received: number }>(`${filePath(Area, Name)}?offset=${offset}${final ? '&final=true' : ''}`,
+                                                                    Content.slice(offset, end));
+
+        Progress?.(done.received, Content.size);
+
+        if (final)
+            return done;
+
+        offset = done.received;
+
+    }
 
 }
 

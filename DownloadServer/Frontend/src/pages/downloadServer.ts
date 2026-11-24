@@ -145,7 +145,7 @@ sftp&gt; get /${area}/station-4.2.1.bin</pre>
                         <div class="kv"><span class="k">Files</span><span class="v">${Status.files} <span class="muted">(${sizeOf(Status.totalSize)})</span></span></div>
                         <div class="kv"><span class="k">Areas</span><span class="v">${Status.areas.map((area, index) => html`${index > 0 ? ', ' : ''}<code>/${area.name}</code> <span class="muted">(${area.files})</span>`)}</span></div>
                         <div class="kv"><span class="k">Directory</span><span class="v"><code>${Status.directory}</code></span></div>
-                        <div class="kv"><span class="k">Largest file</span><span class="v">${sizeOf(Status.maxFileSize)} to publish - through the web interface ${sizeOf(Status.webMaxFileSize)}</span></div>
+                        <div class="kv"><span class="k">Largest file</span><span class="v">${sizeOf(Status.maxFileSize)} to publish - through the web interface in parts of ${sizeOf(Status.webPartSize)}</span></div>
                         <div class="kv"><span class="k">Downloads</span><span class="v">${Status.downloads} <span class="muted">(${sizeOf(Status.downloadedBytes)} by ${Status.downloaders} downloader(s))</span></span></div>
                         <div class="kv"><span class="k">Newest</span><span class="v">${latest === null
                             ? 'nothing downloaded yet'

@@ -44,6 +44,7 @@ namespace cloud.charging.open.DownloadServer
     ///   <item>GET  /api/v1/downloadServer/files/{area}/{name}             - one file: its size, when it was written, its SHA-256.</item>
     ///   <item>GET  /api/v1/downloadServer/files/{area}/{name}/content     - the file itself, to save.</item>
     ///   <item>PUT  /api/v1/downloadServer/files/{area}/{name}             - the body offered as that file, in the place of the one of that name.</item>
+    ///   <item>PUT  /api/v1/downloadServer/files/{area}/{name}?offset=N    - one part of it, at byte N - 0 begins anew -, and with &amp;final=true the last: what the web interface sends of a file larger than one request may be; 409 with "received" where N is not where the parts before ended.</item>
     ///   <item>POST /api/v1/downloadServer/files/{area}/{name}/remove      - the file offered no more.</item>
     ///   <item>GET  /api/v1/downloadServer/downloads                       - what was downloaded, filtered by ?downloader=, ?area=, ?file=, ?since=, ?until=, ordered by ?order=newest|oldest, paged by ?skip= and ?take=.</item>
     ///   <item>GET  /api/v1/downloadServer/downloaders                     - the accounts in the downloader role.</item>
@@ -51,9 +52,10 @@ namespace cloud.charging.open.DownloadServer
     ///   <item>POST /api/v1/downloadServer/downloaders/password            - { "id" }: a new password for a downloader, answered once.</item>
     ///   <item>POST /api/v1/downloadServer/downloaders/remove              - { "id" }: a downloader no longer let download.</item>
     /// </list>
-    /// A file published through this API is as large as the web interface's
-    /// HTTP server takes a request: a larger one is published over SFTP, or
-    /// put in its area's directory.
+    /// A file published through this API in one request is as large as the
+    /// web interface's HTTP server takes a request; a larger one is sent in
+    /// parts, as the web interface does, published over SFTP, or put in its
+    /// area's directory.
     /// </remarks>
     public class DownloadServerHTTPAPI : NodeHTTPAPI
     {
@@ -254,6 +256,43 @@ namespace cloud.charging.open.DownloadServer
             var (area, name) = AreaAndName(Request);
 
             using var body = new MemoryStream(Request.HTTPBody ?? [], writable: false);
+
+            #region One part of a file published in parts: ?offset=<byte>[&final=true]
+
+            if (Request.QueryString.GetString("offset") is String offsetText)
+            {
+
+                if (!Int64.TryParse(offsetText, NumberStyles.None, CultureInfo.InvariantCulture, out var offset))
+                    return ErrorJSON(Request, HTTPStatusCode.BadRequest, $"'offset' is no number of bytes: '{offsetText}'.");
+
+                var final = String.Equals(Request.QueryString.GetString("final"), "true", StringComparison.OrdinalIgnoreCase);
+
+                var (published, received, notTaken, atAnotherOffset) = await DownloadServer.PublishPartAsync(area, name, offset, body, final, user.Id.ToString());
+
+                if (atAnotherOffset)
+                    return JSONResponse(Request, HTTPStatusCode.Conflict, new JObject(
+                               new JProperty("error",     notTaken),
+                               new JProperty("received",  received)
+                           ));
+
+                if (notTaken is not null)
+                    return ErrorJSON(Request,
+                                     DownloadServer.HasArea(area) ? HTTPStatusCode.BadRequest : HTTPStatusCode.NotFound,
+                                     notTaken);
+
+                return JSONResponse(Request, HTTPStatusCode.OK, published is not null
+                                                                    ? new JObject(
+                                                                          new JProperty("said",      $"'{published.Path}' is offered: {DownloadServerNode.SizeOf(published.Size)}."),
+                                                                          new JProperty("received",  received),
+                                                                          new JProperty("file",      published.ToJSON())
+                                                                      )
+                                                                    : new JObject(
+                                                                          new JProperty("received",  received)
+                                                                      ));
+
+            }
+
+            #endregion
 
             var (file, problem) = await DownloadServer.PublishAsync(area, name, body, user.Id.ToString());
 
