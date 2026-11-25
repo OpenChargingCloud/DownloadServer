@@ -1,6 +1,6 @@
 /**
  * How the web interface publishes a file larger than one request may be: in
- * parts, one after the other - and, over a line too slow for the half minute
+ * parts, one after the other - and, over a line too slow for the time
  * the web interface's HTTP server waits for one request's body, in smaller
  * ones, without a byte sent twice into the file.
  *

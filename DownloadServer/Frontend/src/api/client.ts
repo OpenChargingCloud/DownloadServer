@@ -272,7 +272,7 @@ async function put<T>(Path: string, Content: Blob): Promise<T> {
 
         // 408 is Hermod's, in words about the request rather than the file.
         const said = response.status === 408
-                         ? 'A part took longer than the web interface waits for one: half a minute. The line is too slow even for the smallest part.'
+                         ? 'A part took longer than the web interface waits for one - five minutes, unless "web.requestBodyTimeout" says otherwise. The line is too slow even for the smallest part.'
                          : json !== null && typeof json === 'object' && 'error' in json && typeof (json as { error: unknown }).error === 'string'
                                ? (json as { error: string }).error
                                : response.status === 413
@@ -300,7 +300,8 @@ const MostSlowPartsInARow = 8;
 
 /**
  * Whether a PUT failed for the time it took: answered 408 - the web
- * interface's HTTP server waits half a minute for one request's body - or
+ * interface's HTTP server waits five minutes for one request's body unless
+ * "web.requestBodyTimeout" says otherwise - or
  * broken off without an answer, which is how a browser still sending tells
  * of a server that answered 408 and closed the connection.
  */
@@ -317,7 +318,8 @@ function tookTooLong(Problem: unknown): boolean {
  * than so much in one request. Told after each part how many bytes are there.
  *
  * Over a slow line a part may take longer than that server waits for one
- * request's body, half a minute: the part is sent again, half as large - down
+ * request's body, five minutes unless "web.requestBodyTimeout" says
+ * otherwise: the part is sent again, half as large - down
  * to 64 KiB -, and nothing of it was kept. Where the server has more than was
  * thought - an answer lost on the way -, it says how much (409), and the next
  * part begins there.
