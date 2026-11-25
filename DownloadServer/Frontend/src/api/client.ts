@@ -144,13 +144,44 @@ export interface Downloads {
     files:        string[];
 }
 
+/** The certificate the download port shows - its own, not the web interface's. */
+export interface DownloadPortCertificate {
+    /** "store", or "files". */
+    certificate:  string;
+    fullchain:    string | null;
+    privateKey:   string | null;
+    /** The label of the store's identity shown. */
+    label:        string | null;
+    /** The subject of the certificate shown, or null while there is none. */
+    shows:        string | null;
+    thumbprint:   string | null;
+    notAfter:     string | null;
+    /** Why nothing, or not the newest, is shown. */
+    problem:      string | null;
+}
+
+/** The port HTTP downloads are served on. */
+export interface DownloadPort {
+    listening:    boolean;
+    /** The root charging stations are told to download below: "publicURL", or a guess. */
+    url:          string;
+    /** What "downloadServer.publicURL" says, or null where the URL is guessed. */
+    publicURL:    string | null;
+    /** Where the port listens: "http://any:8365/". */
+    listen:       string;
+    tls:          boolean;
+    certificate:  DownloadPortCertificate | null;
+    anonymous:    boolean;
+    refused:      number;
+}
+
 /** How the download server stands: GET /downloadServer. */
 export interface DownloadServerStatus {
     /** The directory the areas lie in. */
     directory:        string;
     areas:            { name: string; files: number; size: number }[];
     /** The port HTTP downloads are served on, or null where they are not. */
-    http:             { listening: boolean; url: string; tls: boolean; anonymous: boolean; refused: number } | null;
+    http:             DownloadPort | null;
     /** SFTP on the SSH server, or null where files are not offered over it. */
     sftp:             { serving: boolean; port: number | null; passwords: boolean } | null;
     /** The largest file that may be published, in bytes. */
@@ -206,6 +237,21 @@ function filePath(Area: string, Name: string): string {
 }
 
 
+/** A PUT the download server answered with an error: its status, and - for a part at another offset - how many bytes it has. */
+export class PutRefused extends Error {
+
+    readonly Status:    number;
+    readonly Received:  number | null;
+
+    constructor(Message: string, Status: number, Received: number | null) {
+        super(Message);
+        this.name      = 'PutRefused';
+        this.Status    = Status;
+        this.Received  = Received;
+    }
+
+}
+
 /** One PUT of bytes, as they are - which the JSON request of every node does not send - and its answer. Same origin, so the session cookie travels with it. */
 async function put<T>(Path: string, Content: Blob): Promise<T> {
 
@@ -224,13 +270,20 @@ async function put<T>(Path: string, Content: Blob): Promise<T> {
 
     if (!response.ok) {
 
-        const said = json !== null && typeof json === 'object' && 'error' in json && typeof (json as { error: unknown }).error === 'string'
-                         ? (json as { error: string }).error
-                         : response.status === 413
-                               ? 'A part is larger than the web interface takes.'
-                               : `The download server answered ${response.status}.`;
+        // 408 is Hermod's, in words about the request rather than the file.
+        const said = response.status === 408
+                         ? 'A part took longer than the web interface waits for one: half a minute. The line is too slow even for the smallest part.'
+                         : json !== null && typeof json === 'object' && 'error' in json && typeof (json as { error: unknown }).error === 'string'
+                               ? (json as { error: string }).error
+                               : response.status === 413
+                                     ? 'A part is larger than the web interface takes.'
+                                     : `The download server answered ${response.status}.`;
 
-        throw new Error(said);
+        const received = json !== null && typeof json === 'object' && 'received' in json && typeof (json as { received: unknown }).received === 'number'
+                             ? (json as { received: number }).received
+                             : null;
+
+        throw new PutRefused(said, response.status, received);
 
     }
 
@@ -239,11 +292,35 @@ async function put<T>(Path: string, Content: Blob): Promise<T> {
 }
 
 
+/** The smallest part a file is sent in: what the server never asks to be smaller, either. */
+export const SmallestPartSize = 64 * 1024;
+
+/** How often in a row a part may fail for the time it took before the publication is given up. */
+const MostSlowPartsInARow = 8;
+
+/**
+ * Whether a PUT failed for the time it took: answered 408 - the web
+ * interface's HTTP server waits half a minute for one request's body - or
+ * broken off without an answer, which is how a browser still sending tells
+ * of a server that answered 408 and closed the connection.
+ */
+function tookTooLong(Problem: unknown): boolean {
+    return Problem instanceof PutRefused
+               ? Problem.Status === 408
+               : Problem instanceof TypeError;
+}
+
 /**
  * Publish a file: whole with one PUT where it fits into one part, and else in
  * parts, one after the other - "?offset=" says where each begins, the last
  * one says "&final=true" -, as the web interface's HTTP server takes no more
  * than so much in one request. Told after each part how many bytes are there.
+ *
+ * Over a slow line a part may take longer than that server waits for one
+ * request's body, half a minute: the part is sent again, half as large - down
+ * to 64 KiB -, and nothing of it was kept. Where the server has more than was
+ * thought - an answer lost on the way -, it says how much (409), and the next
+ * part begins there.
  */
 async function publish(Area:      string,
                        Name:      string,
@@ -251,24 +328,49 @@ async function publish(Area:      string,
                        PartSize:  number,
                        Progress?: (Sent: number, Of: number) => void): Promise<Published> {
 
-    if (Content.size <= PartSize)
-        return put<Published>(filePath(Area, Name), Content);
-
-    let offset = 0;
+    let partSize  = Math.max(SmallestPartSize, PartSize);
+    let offset    = 0;
+    let failed    = 0;
 
     while (true) {
 
-        const end    = Math.min(offset + PartSize, Content.size);
-        const final  = end >= Content.size;
-        const done   = await put<Published & { received: number }>(`${filePath(Area, Name)}?offset=${offset}${final ? '&final=true' : ''}`,
-                                                                    Content.slice(offset, end));
+        try
+        {
 
-        Progress?.(done.received, Content.size);
+            if (offset === 0 && Content.size <= partSize)
+                return await put<Published>(filePath(Area, Name), Content);
 
-        if (final)
-            return done;
+            const end    = Math.min(offset + partSize, Content.size);
+            const final  = end >= Content.size;
+            const done   = await put<Published & { received: number }>(`${filePath(Area, Name)}?offset=${offset}${final ? '&final=true' : ''}`,
+                                                                        Content.slice(offset, end));
 
-        offset = done.received;
+            Progress?.(done.received, Content.size);
+
+            if (final)
+                return done;
+
+            offset  = done.received;
+            failed  = 0;
+
+        }
+        catch (problem)
+        {
+
+            if (++failed > MostSlowPartsInARow)
+                throw problem;
+
+            if (problem instanceof PutRefused && problem.Status === 409 && problem.Received !== null && offset > 0) {
+                offset = problem.Received;
+                continue;
+            }
+
+            if (!tookTooLong(problem) || partSize <= SmallestPartSize)
+                throw problem;
+
+            partSize = Math.max(SmallestPartSize, Math.floor(partSize / 2));
+
+        }
 
     }
 

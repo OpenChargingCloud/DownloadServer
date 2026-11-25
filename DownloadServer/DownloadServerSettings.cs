@@ -25,6 +25,7 @@ using org.GraphDefined.Vanaheimr.Hermod;
 
 using cloud.charging.open.protocols.WWCP.Node;
 using cloud.charging.open.protocols.WWCP.Node.SecureShell;
+using cloud.charging.open.protocols.WWCP.Node.Configuration;
 
 #endregion
 
@@ -44,13 +45,16 @@ namespace cloud.charging.open.DownloadServer
     ///     "http":           true,
     ///     "httpListen":     "any",
     ///     "httpPort":       8365,
+    ///     "tls":            { "certificate": "store" },
+    ///     "publicURL":      "https://downloads.example.org:8365/",
     ///     "anonymousHTTP":  false,
     ///     "sftp":           true,
     ///     "maxFileSize":    1073741824
     /// }
     /// </code>
-    /// Every key may be left out, and then reads as its default. A directory
-    /// that is not given in full lies beside the configuration file. Each area
+    /// Every key may be left out, and then reads as its default - "tls" and
+    /// "publicURL" as none. A directory, and the files of a certificate, that
+    /// are not given in full lie beside the configuration file. Each area
     /// is a directory of its own below it, and the first part of the path a
     /// file is fetched by: "/firmware/station-4.2.1.bin".
     /// </remarks>
@@ -98,6 +102,12 @@ namespace cloud.charging.open.DownloadServer
         /// </summary>
         public const            Int64                  LargestMaxFileSize       = Int32.MaxValue;
 
+        /// <summary>
+        /// The listener of the node's certificate store a TLS server identity
+        /// may be told it is shown on to be shown on the download port.
+        /// </summary>
+        public const            String                 DownloadListener         = "download";
+
         #endregion
 
         #region Properties
@@ -129,6 +139,23 @@ namespace cloud.charging.open.DownloadServer
         /// The TCP port files are downloaded from by HTTP.
         /// </summary>
         public IPPort                 HTTPPort        { get; init; } = DefaultHTTPDownloadPort;
+
+        /// <summary>
+        /// Whether the download port speaks TLS, and with which certificate -
+        /// its own, and not the web interface's: out of the node's certificate
+        /// store the TLS server identity for the listener "download", or one
+        /// told no listener; or a pair of PEM files somebody else keeps up to
+        /// date. Null for plain HTTP.
+        /// </summary>
+        public WebTLSConfiguration?   TLS             { get; init; }
+
+        /// <summary>
+        /// The root of the download port as charging stations reach it - a name
+        /// rather than the address it listens on, a proxy's port in front, its
+        /// "https" - which the banner, the command line and the web interface
+        /// say. Null where it is to be guessed from where the port listens.
+        /// </summary>
+        public Uri?                   PublicURL       { get; init; }
 
         /// <summary>
         /// Whether a file may be downloaded by HTTP without credentials as well
@@ -321,6 +348,63 @@ namespace cloud.charging.open.DownloadServer
 
             #endregion
 
+            #region tls
+
+            // As the "web" section's "tls" is written - a certificate out of the
+            // store, or a pair of PEM files - but without a port of plain HTTP
+            // that redirects: a charging station is told one URL, and follows it.
+            if (json["tls"] is JToken tlsToken && tlsToken.Type != JTokenType.Null)
+            {
+
+                var path = $"{SectionName}.tls";
+
+                if (tlsToken is not JObject tlsJSON)
+                {
+                    Error = $"'{path}' is no JSON object: {{ \"certificate\": \"{WebTLSConfiguration.StoreText}\" }}, or {{ \"certificate\": {{ \"fullchain\": \"<file>\", \"privateKey\": \"<file>\" }} }}.";
+                    return false;
+                }
+
+                if (tlsJSON.ContainsKey("redirectPort"))
+                {
+                    Error = $"'{path}' says 'redirectPort': the download port redirects nowhere - a charging station is told its URL, and HTTPS in it where the port speaks TLS.";
+                    return false;
+                }
+
+                if (!WebTLSConfiguration.TryParse(tlsJSON, path, out var tls, out var tlsError))
+                {
+                    Error = tlsError;
+                    return false;
+                }
+
+                settings = settings with { TLS = tls };
+
+            }
+
+            #endregion
+
+            #region publicURL
+
+            if (json["publicURL"] is JToken urlToken && urlToken.Type != JTokenType.Null)
+            {
+
+                if (urlToken.Type != JTokenType.String)
+                {
+                    Error = $"'{SectionName}.publicURL' is no text: '{urlToken}'. A URL, as \"https://downloads.example.org:8365/\".";
+                    return false;
+                }
+
+                if (!TryParsePublicURL(urlToken.Value<String>(), out var publicURL, out var urlError))
+                {
+                    Error = $"'{SectionName}.publicURL' is no URL a charging station could download from: {urlError}";
+                    return false;
+                }
+
+                settings = settings with { PublicURL = publicURL };
+
+            }
+
+            #endregion
+
             #region maxFileSize
 
             if (json["maxFileSize"] is JToken sizeToken && sizeToken.Type != JTokenType.Null)
@@ -340,6 +424,45 @@ namespace cloud.charging.open.DownloadServer
             #endregion
 
             Settings = settings;
+            return true;
+
+        }
+
+        #endregion
+
+        #region (static) TryParsePublicURL(Text, out URL, out Error)
+
+        /// <summary>
+        /// The root of the download port as charging stations reach it: "http"
+        /// or "https", a host, a port where it is not the scheme's, and a path
+        /// below which "&lt;area&gt;/&lt;file name&gt;" follows - a proxy's
+        /// prefix - but no credentials, query or fragment. Always with a "/" at
+        /// its end.
+        /// </summary>
+        public static Boolean TryParsePublicURL(String?                           Text,
+                                                [NotNullWhen(true)]  out Uri?     URL,
+                                                [NotNullWhen(false)] out String?  Error)
+        {
+
+            URL    = null;
+            Error  = null;
+
+            var text = Text?.Trim() ?? "";
+
+            if (!Uri.TryCreate(text, UriKind.Absolute, out var uri) ||
+                uri.Scheme is not ("http" or "https"))
+            {
+                Error = $"'{text}' is no URL of \"http\" or \"https\", as \"https://downloads.example.org:8365/\".";
+                return false;
+            }
+
+            if (uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0)
+            {
+                Error = $"'{text}' says credentials, a query or a fragment: the URL is the root a charging station is given, and its credentials are its own.";
+                return false;
+            }
+
+            URL = new Uri(uri.GetLeftPart(UriPartial.Path).TrimEnd('/') + "/");
             return true;
 
         }
@@ -401,6 +524,8 @@ namespace cloud.charging.open.DownloadServer
                    new JProperty("http",           HTTP),
                    new JProperty("httpListen",     TextOf(HTTPListen)),
                    new JProperty("httpPort",       HTTPPort.ToUInt16()),
+                   new JProperty("tls",            TLS?.ToJSON()),
+                   new JProperty("publicURL",      PublicURL?.ToString()),
                    new JProperty("anonymousHTTP",  AnonymousHTTP),
                    new JProperty("sftp",           SFTP),
                    new JProperty("maxFileSize",    MaxFileSize)

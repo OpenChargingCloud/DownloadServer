@@ -29,8 +29,3 @@ export function sizeOf(Bytes: number): string {
 export function thisHost(): string {
     return typeof location !== 'undefined' && location.hostname.length > 0 ? location.hostname : 'downloads.example.org';
 }
-
-/** The host of a URL the node gave, with the host a browser reached it at in place of "any". */
-export function reachableURL(URLText: string): string {
-    return URLText.replace('://any:', `://${thisHost()}:`);
-}

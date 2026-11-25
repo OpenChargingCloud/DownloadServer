@@ -1,5 +1,5 @@
 import { api, type DownloadServerStatus } from '../api/client';
-import { reachableURL, sizeOf, thisHost } from '../format';
+import { sizeOf, thisHost } from '../format';
 import type { Page } from '@node/router';
 import { reloadButton, shell } from '@node/shell';
 import { errorMessage, formatSince, formatTimestamp } from '@node/ui';
@@ -44,23 +44,40 @@ export const downloadServerPage: Page = {
                     </section>
                 `;
 
-            const url   = reachableURL(http.url);
-            const area  = Status.areas[0]?.name ?? 'firmware';
+            // What charging stations are told: "publicURL", or the download
+            // server's guess - the same the banner says.
+            const url          = http.url;
+            const behindProxy  = !http.tls && url.startsWith('https:');
+            const certificate  = http.certificate;
+            const area         = Status.areas[0]?.name ?? 'firmware';
 
             return html`
                 <section class="card" id="http-downloads">
 
                     <h2><i class="fa-solid fa-download"></i> HTTP downloads
                         <span class="chip ${http.listening ? 'ok' : 'bad'}">${http.listening ? 'listening' : 'not listening'}</span>
-                        ${http.tls ? html`<span class="chip on">TLS</span>` : html`<span class="chip warn">plain HTTP</span>`}
+                        ${http.tls          ? html`<span class="chip on">TLS</span>`
+                        : behindProxy       ? html`<span class="chip">TLS at a proxy</span>`
+                        :                     html`<span class="chip warn">plain HTTP</span>`}
                     </h2>
 
                     <div class="kv-list">
-                        <div class="kv"><span class="k">Download from</span><span class="v"><code>${url}&lt;area&gt;/&lt;file name&gt;</code></span></div>
+                        <div class="kv"><span class="k">Download from</span><span class="v"><code>${url}&lt;area&gt;/&lt;file name&gt;</code>
+                            ${http.publicURL === null ? html` <span class="muted">(guessed - "publicURL" says it)</span>` : nothing}</span></div>
+                        <div class="kv"><span class="k">Listening on</span><span class="v"><code>${http.listen}</code></span></div>
+                        ${certificate === null ? nothing : html`
+                            <div class="kv"><span class="k">Certificate</span><span class="v">${certificate.shows === null
+                                ? html`<strong>none to show</strong> - every connection is refused: ${certificate.problem}`
+                                : html`${certificate.shows}, until ${formatTimestamp(certificate.notAfter ?? '')},
+                                       <span class="muted">from ${certificate.certificate === 'store'
+                                           ? `the certificate store${certificate.label !== null ? ` ('${certificate.label}')` : ''}`
+                                           : certificate.fullchain}</span>`}</span></div>
+                        `}
                         <div class="kv"><span class="k">Signed in</span><span class="v">${http.anonymous
                             ? html`with the credentials of a downloader - or <strong>without any</strong>: "anonymousHTTP" is true`
                             : 'with the credentials of a downloader, by HTTP Basic Auth'}</span></div>
                         <div class="kv"><span class="k">Ranges</span><span class="v">one range of bytes a request: a download that stopped is taken up where it stopped</span></div>
+                        <div class="kv"><span class="k">Sent</span><span class="v">from the disk as the charging station reads it, for as long as it takes</span></div>
                         <div class="kv"><span class="k">Refused</span><span class="v">${http.refused} since the start</span></div>
                     </div>
 
@@ -73,11 +90,11 @@ export const downloadServerPage: Page = {
                     <p class="hint">Or, to try it by hand:</p>
                     <pre class="ask-with">curl -u CS001:&lt;password&gt; -O ${url}${area}/station-4.2.1.bin</pre>
 
-                    ${http.tls ? nothing : html`
+                    ${http.tls || behindProxy ? nothing : html`
                         <p class="hint warn-line">
                             Over plain HTTP the file can be changed on its way, and the password crosses the network in
-                            the clear. Give the web interface a certificate ("web.tls"), which the download port shows as
-                            well, or put a proxy that speaks TLS in front.
+                            the clear. Give the download port a certificate of its own ("downloadServer.tls"), or put a
+                            proxy that speaks TLS in front and say its "https" URL in "downloadServer.publicURL".
                         </p>
                     `}
 
@@ -145,7 +162,7 @@ sftp&gt; get /${area}/station-4.2.1.bin</pre>
                         <div class="kv"><span class="k">Files</span><span class="v">${Status.files} <span class="muted">(${sizeOf(Status.totalSize)})</span></span></div>
                         <div class="kv"><span class="k">Areas</span><span class="v">${Status.areas.map((area, index) => html`${index > 0 ? ', ' : ''}<code>/${area.name}</code> <span class="muted">(${area.files})</span>`)}</span></div>
                         <div class="kv"><span class="k">Directory</span><span class="v"><code>${Status.directory}</code></span></div>
-                        <div class="kv"><span class="k">Largest file</span><span class="v">${sizeOf(Status.maxFileSize)} to publish - through the web interface in parts of ${sizeOf(Status.webPartSize)}</span></div>
+                        <div class="kv"><span class="k">Largest file</span><span class="v">${sizeOf(Status.maxFileSize)} to publish - through the web interface in parts of ${sizeOf(Status.webPartSize)}, smaller ones over a slow line</span></div>
                         <div class="kv"><span class="k">Downloads</span><span class="v">${Status.downloads} <span class="muted">(${sizeOf(Status.downloadedBytes)} by ${Status.downloaders} downloader(s))</span></span></div>
                         <div class="kv"><span class="k">Newest</span><span class="v">${latest === null
                             ? 'nothing downloaded yet'

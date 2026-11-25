@@ -109,6 +109,12 @@ namespace cloud.charging.open.DownloadServer
         public static readonly      NodePort  HTTPDownloadPort       = new ("HTTP downloads");
 
         /// <summary>
+        /// The listeners of the node's certificate store a TLS server identity
+        /// may be told it is shown on: the web interface, and the download port.
+        /// </summary>
+        public static readonly      IReadOnlyList<String>  CertificateListeners  = [ WebServerCertificate.Listener, DownloadServerSettings.DownloadListener ];
+
+        /// <summary>
         /// The manifest resource prefix of the embedded web interface (see the
         /// EmbedFrontend target of DownloadServer.csproj).
         /// </summary>
@@ -153,10 +159,16 @@ namespace cloud.charging.open.DownloadServer
         public IReadOnlyList<SftpArea>    SftpFileAreas        { get; } = [];
 
         /// <summary>
-        /// Whether the download port speaks TLS - with the web interface's
-        /// certificate, where the node shows one there.
+        /// The certificate the download port shows - its own, where the section
+        /// says "tls" - or null for plain HTTP.
         /// </summary>
-        public Boolean                    DownloadsOverHTTPS   { get; }
+        public DownloadPortCertificate?   DownloadCertificate  { get; }
+
+        /// <summary>
+        /// Whether the download port speaks TLS.
+        /// </summary>
+        public Boolean                    DownloadsOverHTTPS
+            => DownloadCertificate is not null;
 
         /// <summary>
         /// How many HTTP downloads were turned away since the start: without
@@ -231,6 +243,7 @@ namespace cloud.charging.open.DownloadServer
                    Frontend:              Frontend ?? new EmbeddedContentSource(HTTPRoot, typeof(DownloadServerNode).Assembly),
                    CertificatesPath:      CertificatesPath,
                    CertificateKinds:      CertificateKinds,
+                   CertificateListeners:  CertificateListeners,
                    Log:                   Log,
                    LogToConsole:          LogToConsole,
                    ConsoleLogLevel:       ConsoleLogLevel,
@@ -282,22 +295,34 @@ namespace cloud.charging.open.DownloadServer
             if (Settings.HTTP)
             {
 
-                // With the web interface's certificate, where it shows one: a
-                // charging station believes what it installs only as far as it
-                // believes where it came from, and one certificate to renew is
-                // one thing to forget less.
-                var certificate           = WebCertificate;
+                // A certificate of its own, and not the web interface's: the
+                // download port is reached by charging stations under a name of
+                // their network, the web interface by people under another - and
+                // either may speak TLS without the other. A charging station
+                // believes what it installs only as far as it believes where it
+                // came from.
+                if (Settings.TLS is WebTLSConfiguration tls)
+                    this.DownloadCertificate  = new DownloadPortCertificate(
+                                                    (tls.Certificate ?? WebCertificateSource.Store).Beside(this.ConfigFile.Path),
+                                                    ListenerCertificates.For(DownloadServerSettings.DownloadListener, "the download port"),
+                                                    this.Log
+                                                );
 
-                this.DownloadsOverHTTPS   = certificate is not null;
+                var certificate               = this.DownloadCertificate;
 
-                this.DownloadPort         = new HTTPServer(
-                                                IPAddress:                  Settings.HTTPListen,
-                                                TCPPort:                    Settings.HTTPPort,
-                                                HTTPServerName:             $"OpenChargingCloud {Kind.Product} v{this.Version}",
-                                                ServerCertificateSelector:  certificate is not null
-                                                                                ? (server, client) => certificate.ChainFor(server, client).Certificate
-                                                                                : null
-                                            );
+                // An HTTP server of its own, on a port of its own. A file is
+                // sent as a stream read from the disk as the client takes it -
+                // see ServeDownload - and never held in memory; Hermod sets no
+                // time for the whole of a response, so a slow charging station
+                // takes as long as it needs.
+                this.DownloadPort             = new HTTPServer(
+                                                    IPAddress:                  Settings.HTTPListen,
+                                                    TCPPort:                    Settings.HTTPPort,
+                                                    HTTPServerName:             $"OpenChargingCloud {Kind.Product} v{this.Version}",
+                                                    ServerCertificateSelector:  certificate is not null
+                                                                                    ? (server, client) => certificate.ChainFor(server, client).Certificate
+                                                                                    : null
+                                                );
 
                 if (certificate is not null)
                     this.DownloadPort.ServerCertificateChainSelector = certificate.ChainFor;
@@ -470,10 +495,16 @@ namespace cloud.charging.open.DownloadServer
 
             Log.Notice($"Files are offered {ListenersText()}; {Files(null).Count} lie in {String.Join(", ", Settings.Areas.Select(area => $"/{area}"))} of '{FilesDirectory}'.", "downloadserver");
 
-            if (DownloadPort is not null && !DownloadsOverHTTPS)
+            // Not where the URL charging stations are told is "https": then a
+            // proxy in front speaks TLS, and plain HTTP behind it is its business.
+            if (DownloadPort is not null && !DownloadsOverHTTPS && DownloadURL.Scheme != Uri.UriSchemeHttps)
                 Log.Warning($"HTTP downloads are served over plain HTTP: what a charging station fetches can be changed on its way, and the password it signs in with crosses the network in the clear. " +
-                            $"Give the web interface a certificate (\"web.tls\"), which the download port then shows as well, or put a proxy that speaks TLS in front.",
+                            $"Give the download port a certificate (\"{DownloadServerSettings.SectionName}.tls\", or --download-https), or put a proxy that speaks TLS in front and tell \"{DownloadServerSettings.SectionName}.publicURL\" its \"https\" URL.",
                             "downloadserver", "http", "security");
+
+            if (DownloadPort is not null && Settings.PublicURL is null && Settings.HTTPListen.TryGetValue(out IPvXAddress _))
+                Log.Info($"Charging stations are told to download from {DownloadURL}, a guess from the name of this machine: where they know it by another name, say it in \"{DownloadServerSettings.SectionName}.publicURL\" (or --download-url).",
+                         "downloadserver", "http");
 
             if (DownloadPort is not null && Settings.AnonymousHTTP)
                 Log.Warning($"HTTP downloads are served without credentials as well (\"anonymousHTTP\": true): whoever reaches the port fetches every file offered.",
@@ -518,15 +549,54 @@ namespace cloud.charging.open.DownloadServer
 
         #endregion
 
-        #region DownloadURL / ListenersText()
+        #region DownloadURL / DownloadListenURL / ListenersText()
 
         /// <summary>
-        /// The root of the download port, as the banner and the web interface
-        /// say it: "http://any:8365/".
+        /// The root of the download port as charging stations are told it -
+        /// by the banner, the command line and the web interface: what
+        /// "publicURL" says, or - failing that - guessed from where the port
+        /// listens: the address it is given, or the name of this machine where
+        /// it listens on every address.
         /// </summary>
-        public String DownloadURL
+        public Uri DownloadURL
+
+            => Settings.PublicURL ?? new Uri($"{(DownloadsOverHTTPS ? "https" : "http")}://{GuessedHost()}:{Settings.HTTPPort}/");
+
+        /// <summary>
+        /// Where the download port listens, as a URL: "http://any:8365/".
+        /// </summary>
+        public String DownloadListenURL
 
             => $"{(DownloadsOverHTTPS ? "https" : "http")}://{DownloadServerSettings.TextOf(Settings.HTTPListen)}:{Settings.HTTPPort}/";
+
+        /// <summary>
+        /// The host a charging station would be told where nobody said: the
+        /// address the download port listens on, or the name of this machine
+        /// where it listens on every address.
+        /// </summary>
+        private String GuessedHost()
+        {
+
+            if (!Settings.HTTPListen.TryGetValue(out IPvXAddress _))
+            {
+                var address = Settings.HTTPListen.ToString();
+                return address.Contains(':') && !address.StartsWith('[')
+                           ? $"[{address}]"
+                           : address;
+            }
+
+            try
+            {
+                var name = System.Net.Dns.GetHostName();
+                if (!String.IsNullOrWhiteSpace(name))
+                    return name.ToLowerInvariant();
+            }
+            catch (SocketException)
+            { }
+
+            return "localhost";
+
+        }
 
         /// <summary>
         /// Where files are offered, as the banner and the command line say it.
@@ -537,7 +607,8 @@ namespace cloud.charging.open.DownloadServer
             var listeners = new List<String>();
 
             if (DownloadPort is not null)
-                listeners.Add($"by HTTP GET on {DownloadURL}<area>/<file name>");
+                listeners.Add($"by HTTP GET on {DownloadURL}<area>/<file name>" +
+                              (DownloadURL.ToString() != DownloadListenURL ? $" (listening on {DownloadListenURL})" : ""));
 
             if (SftpFileAreas.Count > 0)
                 listeners.Add(SFTPEnabled
@@ -572,9 +643,12 @@ namespace cloud.charging.open.DownloadServer
                                                             )))),
                        new JProperty("http",                DownloadPort is not null
                                                                 ? new JObject(
-                                                                      new JProperty("listening",  DownloadPort.IsRunning),
-                                                                      new JProperty("url",        DownloadURL),
-                                                                      new JProperty("tls",        DownloadsOverHTTPS),
+                                                                      new JProperty("listening",    DownloadPort.IsRunning),
+                                                                      new JProperty("url",          DownloadURL.ToString()),
+                                                                      new JProperty("publicURL",    Settings.PublicURL?.ToString()),
+                                                                      new JProperty("listen",       DownloadListenURL),
+                                                                      new JProperty("tls",          DownloadsOverHTTPS),
+                                                                      new JProperty("certificate",  DownloadCertificate?.ToJSON()),
                                                                       new JProperty("anonymous",  Settings.AnonymousHTTP),
                                                                       new JProperty("refused",    HTTPDownloadsRefused)
                                                                   )
