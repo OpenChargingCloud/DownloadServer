@@ -1,5 +1,7 @@
 # DownloadServer
 
+![The EV charging test environment, the download server (Download) highlighted](docs/EVChargingTestEnvironment.svg)
+
 The download server for charging stations and local controllers as a
 [WWCP_Node](https://github.com/OpenChargingCloud/WWCP_Node): it offers files -
 firmware images first of all, and whatever else they are pointed to - by HTTP
